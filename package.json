@@ -1,0 +1,8 @@
+{
+  "name": "turo-sync-watch",
+  "private": true,
+  "description": "Support console prototype for 1Now: dead Turo connections and the double-bookings they cause.",
+  "scripts": {
+    "test": "node --test tests/logic.test.js"
+  }
+}
