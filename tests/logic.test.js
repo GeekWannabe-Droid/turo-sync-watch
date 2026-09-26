@@ -12,21 +12,7 @@ const { DEMO_NOW: NOW, operators, AGENT_NAME } = require('../data.js');
 
 const op = (id) => operators.find((o) => o.id === id);
 const down = operators.filter((o) => L.isDown(o));
-
-// Resolve a collision the way the screens do: recommended pick, then record the move.
-function resolveAll(o) {
-  const moves = [];
-  const outcomes = [];
-  for (const col of L.findCollisions(o, NOW)) {
-    const keeper = L.decideKeeper(col, NOW);
-    const opts = L.replacementOptions(o, col, keeper.move, moves);
-    const rec = L.recommend(opts);
-    const choice = L.choiceFor(opts, rec.carId || 'refund');
-    moves.push({ bookingId: keeper.move.id, toCarId: rec.carId, start: keeper.move.start, end: keeper.move.end, renter: keeper.move.renter, source: 'moved' });
-    outcomes.push({ col, keeper, kind: choice.kind, toCar: choice.car });
-  }
-  return outcomes;
-}
+const ids = (cars) => cars.map((c) => c.id);
 
 // ---------------------------------------------------------------------------
 // The data itself has to be believable
@@ -148,143 +134,118 @@ test('trips that touch end-to-start are not a clash', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Resolving
+// One double-booking: facts for the operator
 // ---------------------------------------------------------------------------
 
-test('Civic: Turo renter keeps it, Elantra offered, booked cars skipped', () => {
+test('Civic: Elantra free for Marcus; Elantra and Altima free for Priya', () => {
   const o = op('harbor-drive');
-  const col = L.findCollisions(o, NOW)[0];
-  const k = L.decideKeeper(col, NOW);
-  assert.equal(k.keep.renter, 'Marcus T.');
-  assert.equal(k.move.renter, 'Priya Shah');
-  const opts = L.replacementOptions(o, col, k.move, []);
-  const free = opts.filter((x) => x.free).map((x) => x.car.id);
-  assert.deepEqual(free, ['elantra', 'altima']);
-  assert.deepEqual(L.recommend(opts), { kind: 'swap', carId: 'elantra' });
-  const corolla = opts.find((x) => x.car.id === 'corolla');
-  assert.equal(corolla.blockedBy.id, 'hd-p1'); // Grant W. on Turo
+  const f = L.clashFacts(o, L.findCollisions(o, NOW)[0], NOW);
+  assert.deepEqual(ids(f.freeTuro), ['elantra']);
+  assert.deepEqual(ids(f.freeSite), ['elantra', 'altima']);
+  assert.deepEqual(ids(f.shared), ['elantra']);
+  assert.equal(f.turoDriving, false);
+  assert.equal(f.siteDriving, false);
 });
 
-test('Corolla: no compact free, RAV4 offered as a free upgrade', () => {
+test('Corolla: only the RAV4 is free, for either renter', () => {
   const o = op('harbor-drive');
-  const col = L.findCollisions(o, NOW)[1];
-  const k = L.decideKeeper(col, NOW);
-  assert.equal(k.keep.renter, 'Elena V.');
-  assert.equal(k.move.renter, 'Jordan Blake');
-  const opts = L.replacementOptions(o, col, k.move, []);
-  assert.deepEqual(opts.filter((x) => x.free).map((x) => x.car.id), ['rav4']);
-  assert.deepEqual(L.recommend(opts), { kind: 'upgrade', carId: 'rav4' });
+  const f = L.clashFacts(o, L.findCollisions(o, NOW)[1], NOW);
+  assert.deepEqual(ids(f.freeTuro), ['rav4']);
+  assert.deepEqual(ids(f.freeSite), ['rav4']);
+  assert.deepEqual(ids(f.shared), ['rav4']);
 });
 
-test('Peachtree Forte: every other car booked, so refund', () => {
+test('Peachtree Forte: no other car free for either renter', () => {
   const o = op('peachtree');
   const col = L.findCollisions(o, NOW)[0];
-  const k = L.decideKeeper(col, NOW);
-  assert.equal(k.keep.renter, 'Jake R.');
-  const opts = L.replacementOptions(o, col, k.move, []);
-  assert.equal(opts.filter((x) => x.free).length, 0);
-  assert.deepEqual(L.recommend(opts), { kind: 'refund', carId: null });
-  const choice = L.choiceFor(opts, 'refund');
-  assert.equal(choice.why, 'none-free');
-  assert.match(L.renterMessage(o, col, k, choice), /Every other car we have is booked for your dates/);
+  const f = L.clashFacts(o, col, NOW);
+  assert.equal(f.freeTuro.length, 0);
+  assert.equal(f.freeSite.length, 0);
+  assert.match(L.clashMessage(o, col, NOW), /No other car in your fleet is free for either renter's dates\./);
 });
 
-test('a car already held for one renter is not offered to another', () => {
+test('the Civic message to the operator, word for word', () => {
+  const o = op('harbor-drive');
+  const msg = L.clashMessage(o, L.findCollisions(o, NOW)[0], NOW);
+  assert.equal(msg, [
+    "Hi Luis, now that you've reconnected, we checked every booking from the gap. Your Honda Civic is double-booked:",
+    '',
+    '- Marcus T. booked it on Turo: Fri 2 Oct 10:00 → Tue 6 Oct 10:00',
+    '- Priya Shah booked it on your site: Fri 2 Oct 14:00 → Sun 4 Oct 14:00',
+    '',
+    'They overlap from Fri 2 Oct, 14:00, which is in 4 days.',
+    '',
+    "Cars free for Marcus's dates: Hyundai Elantra.",
+    "Cars free for Priya's dates: Hyundai Elantra, Nissan Altima.",
+    'The Hyundai Elantra can only go to one of them.',
+    '',
+    "If you cancel the Turo trip, Turo can charge you a fee and adds an automatic review to the car's listing saying you cancelled.",
+    '',
+    "How do you want to handle it? Tell me what you decide and I'll note it on the ticket. If it helps, I can draft the message to whichever renter you move.",
+  ].join('\n'));
+});
+
+test('the tool never decides who keeps the car', () => {
+  for (const o of down) {
+    for (const col of L.findCollisions(o, NOW)) {
+      const msg = L.clashMessage(o, col, NOW);
+      assert.doesNotMatch(msg, /keeps|keep the car|we've moved|refunded/i);
+      assert.match(msg, /How do you want to handle it\?/);
+    }
+  }
+});
+
+test('if a renter already has the car, the message says so', () => {
   const o = {
-    cars: [{ id: 'a', name: 'Car A', cls: 'compact' }, { id: 'b', name: 'Car B', cls: 'compact' }],
-    bookings: [
-      { id: 't1', carId: 'a', source: 'turo', renter: 'T', start: '2026-10-02T10:00', end: '2026-10-05T10:00', createdAt: '2026-09-25T10:00' },
-      { id: 'd1', carId: 'a', source: 'direct', renter: 'D One', start: '2026-10-03T10:00', end: '2026-10-04T10:00', createdAt: '2026-09-25T11:00' },
-    ],
+    owner: { first: 'Sam' },
+    connection: { reason: 'SIGNIN_EXPIRED' },
+    cars: [{ id: 'a', name: 'Car A', cls: 'compact' }],
+    bookings: [],
   };
-  const col = { id: 'x', carId: 'a', turo: o.bookings[0], direct: o.bookings[1] };
-  const hold = [{ bookingId: 'other', toCarId: 'b', start: '2026-10-03T12:00', end: '2026-10-05T12:00', renter: 'Someone', source: 'moved' }];
-  const opts = L.replacementOptions(o, col, o.bookings[1], hold);
-  assert.equal(opts[0].free, false);
-  assert.equal(opts[0].blockedBy.renter, 'Someone');
-});
-
-test('a booking moved off a car frees that car for someone else', () => {
-  const o = {
-    cars: [{ id: 'a', name: 'Car A', cls: 'compact' }, { id: 'b', name: 'Car B', cls: 'compact' }],
-    bookings: [
-      { id: 't1', carId: 'a', source: 'turo', renter: 'T', start: '2026-10-02T10:00', end: '2026-10-05T10:00', createdAt: '2026-09-25T10:00' },
-      { id: 'd1', carId: 'a', source: 'direct', renter: 'D One', start: '2026-10-03T10:00', end: '2026-10-04T10:00', createdAt: '2026-09-25T11:00' },
-      { id: 'd2', carId: 'b', source: 'direct', renter: 'D Two', start: '2026-10-03T10:00', end: '2026-10-04T10:00', createdAt: '2026-09-25T12:00' },
-    ],
-  };
-  const col = { id: 'x', carId: 'a', turo: o.bookings[0], direct: o.bookings[1] };
-  assert.equal(L.replacementOptions(o, col, o.bookings[1], [])[0].free, false);
-  const moved = [{ bookingId: 'd2', toCarId: null, start: '2026-10-03T10:00', end: '2026-10-04T10:00', renter: 'D Two', source: 'moved' }];
-  assert.equal(L.replacementOptions(o, col, o.bookings[1], moved)[0].free, true);
-});
-
-test('if the site renter is already driving the car, they keep it and the Turo trip moves', () => {
   const col = {
+    carId: 'a',
     turo: { id: 't', renter: 'Tess R.', start: '2026-09-28T12:00', end: '2026-10-01T12:00' },
     direct: { id: 'd', renter: 'Dan Cole', start: '2026-09-27T10:00', end: '2026-09-29T10:00' },
+    clashStart: L.ms('2026-09-28T12:00'),
   };
-  const k = L.decideKeeper(col, NOW);
-  assert.equal(k.keep.id, 'd');
-  assert.equal(k.moveSource, 'turo');
-});
-
-test('refund wording never claims every car is booked when one is free', () => {
-  const o = op('harbor-drive');
-  const col = L.findCollisions(o, NOW)[0];
-  const k = L.decideKeeper(col, NOW);
-  const opts = L.replacementOptions(o, col, k.move, []);
-  const choice = L.choiceFor(opts, 'refund'); // agent chose refund although Elantra is free
-  assert.equal(choice.why, 'chosen');
-  const msg = L.renterMessage(o, col, k, choice);
-  assert.doesNotMatch(msg, /Every other car/);
-  assert.match(msg, /We're cancelling this booking and refunding you in full/);
+  assert.equal(L.clashFacts(o, col, NOW).siteDriving, true);
+  assert.match(L.clashMessage(o, col, NOW), /Dan Cole already has the car\./);
 });
 
 // ---------------------------------------------------------------------------
 // Messages and summary
 // ---------------------------------------------------------------------------
 
-test('messages use real names and never print undefined or NaN', () => {
+test('messages use real names and never print undefined, NaN or null', () => {
   for (const o of down) {
     const rm = L.reconnectMessage(o, NOW);
     if (rm !== null) assert.doesNotMatch(rm, /undefined|NaN|null/);
-    for (const out of resolveAll(o)) {
-      const opts = L.replacementOptions(o, out.col, out.keeper.move, []);
-      const choice = L.choiceFor(opts, out.toCar ? out.toCar.id : 'refund');
-      const msg = L.renterMessage(o, out.col, out.keeper, choice);
-      assert.doesNotMatch(msg, /undefined|NaN|null/);
-      assert.match(msg, new RegExp(`Hi ${L.firstName(out.keeper.move.renter)},`));
+    for (const col of L.findCollisions(o, NOW)) {
+      assert.doesNotMatch(L.clashMessage(o, col, NOW), /undefined|NaN|null/);
     }
   }
   assert.equal(L.reconnectMessage(op('blue-key'), NOW), null); // internal, no operator message
-});
-
-test('Civic message offers the Elantra at the same price', () => {
-  const o = op('harbor-drive');
-  const col = L.findCollisions(o, NOW)[0];
-  const k = L.decideKeeper(col, NOW);
-  const opts = L.replacementOptions(o, col, k.move, []);
-  const msg = L.renterMessage(o, col, k, L.choiceFor(opts, 'elantra'));
-  assert.match(msg, /^Hi Priya,/);
-  assert.match(msg, /Honda Civic for Fri 2 – Sun 4 Oct/);
-  assert.match(msg, /Hyundai Elantra free for you instead\. Same size, same dates, same price\./);
 });
 
 test('Peachtree reconnect message mentions the repeat', () => {
   assert.match(L.reconnectMessage(op('peachtree'), NOW), /This is the 3rd time in 60 days/);
 });
 
-test('Harbor Drive summary adds up', () => {
+test("Harbor Drive summary adds up and records the operator's decisions", () => {
   const o = op('harbor-drive');
-  const text = L.ticketSummary(o, NOW, L.ms(NOW), resolveAll(o), AGENT_NAME);
+  const [civic, corolla] = L.findCollisions(o, NOW);
+  const text = L.ticketSummary(o, NOW, L.ms(NOW), [
+    { col: civic, note: '  Gave Priya the Nissan Altima  ' },
+    { col: corolla, note: '' },
+  ], AGENT_NAME);
   assert.match(text, /stopped on Sat 19 Sep at 08:12 because the Turo sign-in expired/);
   assert.match(text, /How long: 9 days\. In that time 12 bookings came in on your site and 9 came in on Turo/);
-  assert.match(text, /2 cars were double-booked/);
-  assert.match(text, /- Honda Civic, Fri 2 – Sun 4 Oct: Marcus T\. \(Turo\) keeps it\. Priya Shah moves to the Hyundai Elantra\./);
-  assert.match(text, /- Toyota Corolla, Sat 17 – Mon 19 Oct: Elena V\. \(Turo\) keeps it\. Jordan Blake moves to the Toyota RAV4 at no extra cost\./);
+  assert.match(text, /What it hit: 2 cars were double-booked, and you sorted both\./);
+  assert.match(text, /- Honda Civic: Marcus T\. \(Turo\) and Priya Shah \(your site\) from Fri 2 Oct, 14:00\. What you did: Gave Priya the Nissan Altima\./);
+  assert.match(text, /- Toyota Corolla: Elena V\. \(Turo\) and Jordan Blake \(your site\) from Sat 17 Oct, 09:00\. Sorted by you\./);
   assert.match(text, /The other 10 bookings are fine\./);
   assert.match(text, /All 8 cars are syncing again/);
+  assert.match(text, /Zahid, 1Now Support$/);
   assert.doesNotMatch(text, /undefined|NaN|null/);
 });
 
@@ -296,8 +257,9 @@ test('summaries for the quiet cases', () => {
   const bk = L.ticketSummary(op('blue-key'), NOW, L.ms(NOW), [], AGENT_NAME);
   assert.match(bk, /That was on our side, not yours/);
   assert.match(bk, /Syncing recovered/);
-  const pt = L.ticketSummary(op('peachtree'), NOW, L.ms(NOW), resolveAll(op('peachtree')), AGENT_NAME);
-  assert.match(pt, /Ella Jensen is refunded/);
+  const pt = L.ticketSummary(op('peachtree'), NOW, L.ms(NOW), [{ col: L.findCollisions(op('peachtree'), NOW)[0], note: 'Refunded Ella' }], AGENT_NAME);
+  assert.match(pt, /1 car was double-booked, and you sorted it\./);
+  assert.match(pt, /What you did: Refunded Ella\./);
   assert.match(pt, /3rd time in 60 days/);
 });
 

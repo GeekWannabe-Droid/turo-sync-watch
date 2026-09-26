@@ -1,9 +1,12 @@
 /*
   Turo Sync Watch: the rules.
 
-  Everything the tool decides lives in this file: what counts as a blind
-  booking, which connections to chase first, who keeps a double-booked car,
-  which replacement car to offer, and what the messages say.
+  Everything the tool works out lives in this file: which site bookings were
+  taken blind, which connections to chase first, which bookings clash after a
+  reconnect, which cars are free, and what the messages say.
+
+  It never decides who keeps a double-booked car. That's the operator's call.
+  Support gives him the facts, then records what he decided.
 
   No screen code here, so every rule can be tested on its own
   (see tests/logic.test.js).
@@ -103,8 +106,6 @@
   // Reference lists
   // ---------------------------------------------------------------------------
 
-  // Bigger number = bigger car. Used to rank replacement cars.
-  const CLASS_RANK = { compact: 1, midsize: 2, suv: 3, premium: 4 };
   const CLASS_LABEL = { compact: 'Compact', midsize: 'Midsize', suv: 'SUV', premium: 'Premium' };
 
   // Why a connection broke. Each reason needs a different conversation.
@@ -140,6 +141,12 @@
 
   // How long a Turo limit can last before engineering gets pulled in.
   const ENGINEERING_AFTER = 6 * HOUR;
+
+  // A fact the operator needs before deciding who keeps a double-booked car.
+  // Source: https://turo.com/us/en/policies/cancellation
+  // ("can" because Turo excuses the fee for some hosts, such as All-Star Hosts.)
+  const TURO_CANCEL_FACT =
+    "If you cancel the Turo trip, Turo can charge you a fee and adds an automatic review to the car's listing saying you cancelled.";
 
   // ---------------------------------------------------------------------------
   // Bookings and connections
@@ -285,152 +292,35 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Resolving one double-booking
+  // One double-booking: the facts the operator needs to decide
   // ---------------------------------------------------------------------------
 
-  // Who keeps the car. Whoever already has it keeps it. Otherwise the Turo
-  // renter keeps it: a host who cancels on Turo pays a fee and gets an automatic
-  // review on the listing (turo.com/us/en/policies/cancellation), while the site
-  // renter is the operator's own customer, so the operator can talk to them.
-  function decideKeeper(col, now) {
+  // Other cars in the fleet with nothing booked during this booking's dates.
+  function freeCarsFor(op, booking, excludeCarId) {
+    return op.cars.filter(
+      (car) => car.id !== excludeCarId && !op.bookings.some((b) => b.carId === car.id && overlaps(b, booking)),
+    );
+  }
+
+  // Facts only. Who keeps the car is left to the operator.
+  function clashFacts(op, col, now) {
     const n = ms(now);
     const driving = (b) => ms(b.start) <= n && n < ms(b.end);
-
-    if (driving(col.direct) && !driving(col.turo)) {
-      return {
-        keep: col.direct,
-        move: col.turo,
-        moveSource: 'turo',
-        reasons: [
-          `${col.direct.renter} already has the car.`,
-          `${col.turo.renter}'s Turo trip has to change, and Turo trips can only be changed in Turo.`,
-        ],
-      };
-    }
-
-    const reasons = driving(col.turo)
-      ? [`${col.turo.renter} already has the car.`]
-      : ['Neither trip has started yet.', "Cancelling a Turo trip costs the host a fee and puts an automatic review on the car's Turo listing saying they cancelled."];
-    reasons.push(`${col.direct.renter} booked on the operator's own site, so the operator can talk to them directly and offer another car.`);
-    return { keep: col.turo, move: col.direct, moveSource: 'direct', reasons };
-  }
-
-  // Every other car in the fleet, checked for the moving renter's dates.
-  // `moves` are earlier decisions: bookings already moved or refunded.
-  // A moved booking frees its old car and holds its new one.
-  function replacementOptions(op, col, moving, moves) {
-    const done = moves || [];
-    const movedIds = new Set(done.map((m) => m.bookingId));
-    const want = CLASS_RANK[carById(op, col.carId).cls];
-
-    return op.cars
-      .filter((c) => c.id !== col.carId)
-      .map((car) => {
-        const clash =
-          op.bookings.find((b) => b.carId === car.id && b.id !== moving.id && !movedIds.has(b.id) && overlaps(b, moving)) ||
-          done.find((m) => m.toCarId === car.id && m.bookingId !== moving.id && overlaps(m, moving)) ||
-          null;
-        const rank = CLASS_RANK[car.cls];
-        const fit = rank === want ? 'same' : rank > want ? 'bigger' : 'smaller';
-        return { car, fit, free: !clash, blockedBy: clash };
-      });
-  }
-
-  // Same size first. Then the smallest bigger car, at no extra cost.
-  // Nothing suitable free: refund.
-  function recommend(options) {
-    const free = options.filter((o) => o.free);
-    const same = free.filter((o) => o.fit === 'same');
-    if (same.length) return { kind: 'swap', carId: same[0].car.id };
-    const bigger = free
-      .filter((o) => o.fit === 'bigger')
-      .sort((a, b) => CLASS_RANK[a.car.cls] - CLASS_RANK[b.car.cls]);
-    if (bigger.length) return { kind: 'upgrade', carId: bigger[0].car.id };
-    return { kind: 'refund', carId: null };
-  }
-
-  // Turns a pick (a car id, or 'refund') into what the messages need.
-  function choiceFor(options, pick) {
-    const opt = pick && pick !== 'refund' ? options.find((o) => o.car.id === pick && o.free) : null;
-    if (opt) {
-      const kind = opt.fit === 'same' ? 'swap' : opt.fit === 'bigger' ? 'upgrade' : 'downgrade';
-      return { kind, car: opt.car };
-    }
-    const free = options.filter((o) => o.free);
-    const sameOrBigger = free.filter((o) => o.fit !== 'smaller');
-    const smaller = free.filter((o) => o.fit === 'smaller');
-    let why = 'chosen';
-    if (!free.length) why = 'none-free';
-    else if (!sameOrBigger.length) why = 'only-smaller';
-    return { kind: 'refund', car: null, why, smallerFree: why === 'only-smaller' ? smaller.map((o) => o.car) : [] };
+    const freeTuro = freeCarsFor(op, col.turo, col.carId);
+    const freeSite = freeCarsFor(op, col.direct, col.carId);
+    return {
+      car: carById(op, col.carId),
+      freeTuro,
+      freeSite,
+      shared: freeTuro.filter((c) => freeSite.some((d) => d.id === c.id)),
+      turoDriving: driving(col.turo),
+      siteDriving: driving(col.direct),
+    };
   }
 
   // ---------------------------------------------------------------------------
-  // Messages
+  // Messages to the operator
   // ---------------------------------------------------------------------------
-
-  // To the renter who has to move. Honest about what happened, no blame on them.
-  function renterMessage(op, col, keeper, choice) {
-    const orig = carById(op, col.carId).name;
-    const b = keeper.move;
-    const days = fmtDays(b.start, b.end);
-    const hi = `Hi ${firstName(b.renter)},`;
-
-    if (keeper.moveSource === 'turo') {
-      const opening = `This is ${op.owner.first}, your host for the ${orig} on Turo (${days}). A calendar error on my side let the car be booked twice for your dates. I'm sorry.`;
-      const offer = choice.kind === 'refund'
-        ? "I don't have another car free for your dates, so I'll cancel through Turo and you'll get a full refund through Turo."
-        : `The ${choice.car.name} is free for the same dates. If you'd like it, reply here and I'll arrange the change through Turo.`;
-      return `${hi}\n\n${opening}\n\n${offer}\n\nSorry again,\n${op.owner.first}`;
-    }
-
-    const opening = `This is ${op.owner.first} from ${op.name}. There's a problem with your booking of the ${orig} for ${days}. A calendar error on our side let the same car be booked twice for your dates. That's our mistake, not yours.`;
-    const fallback = "If that doesn't work for you, reply and we'll cancel with a full refund.";
-    let offer;
-    switch (choice.kind) {
-      case 'swap':
-        offer = `We've kept a ${choice.car.name} free for you instead. Same size, same dates, same price. Reply YES and it's yours. Nothing else about your booking changes.\n\n${fallback}`;
-        break;
-      case 'upgrade':
-        offer = `We've kept a ${choice.car.name} free for you instead. It's a bigger car at no extra cost, for the same dates. Reply YES and it's yours. Nothing else about your booking changes.\n\n${fallback}`;
-        break;
-      case 'downgrade':
-        offer = `The only car free for your dates is a ${choice.car.name}, which is smaller than the ${orig}. If it works for you, reply YES and we'll switch you over and refund the difference. If not, reply and we'll cancel with a full refund.`;
-        break;
-      default: {
-        const lead = choice.why === 'none-free'
-          ? "Every other car we have is booked for your dates, so we're cancelling this booking and refunding you in full."
-          : choice.why === 'only-smaller'
-            ? "No car the same size or bigger is free for your dates, so we're cancelling this booking and refunding you in full."
-            : "We're cancelling this booking and refunding you in full.";
-        offer = `${lead} The refund goes back to the card you paid with.`;
-        if (choice.smallerFree && choice.smallerFree.length) {
-          offer += `\n\nIf a smaller car would work, the ${choice.smallerFree[0].name} is free for your dates. Reply and we'll book it for you instead.`;
-        }
-      }
-    }
-    return `${hi}\n\n${opening}\n\n${offer}\n\nSorry for the trouble,\n${op.owner.first}\n${op.name}`;
-  }
-
-  // What the operator has to do after the message goes out.
-  function operatorSteps(op, col, keeper, choice) {
-    const b = keeper.move;
-    const who = firstName(b.renter);
-    if (keeper.moveSource === 'turo') {
-      return [
-        `Send the message to ${who} in Turo messages.`,
-        choice.kind === 'refund' ? `Cancel ${who}'s trip in Turo.` : `Change ${who}'s trip in Turo once they agree.`,
-      ];
-    }
-    if (choice.kind === 'refund') {
-      return [`Cancel and refund ${who}'s booking in 1Now.`, `Send ${who} the message.`];
-    }
-    return [
-      `Send ${who} the message.`,
-      `When ${who} replies YES, move the booking to the ${choice.car.name} in 1Now.`,
-      `Have the ${choice.car.name} ready for ${fmtWhen(b.start)}.`,
-    ];
-  }
 
   // Asking the operator to reconnect. Different wording for each reason.
   function reconnectMessage(op, now) {
@@ -460,8 +350,41 @@
     return `Hi ${who}, your Turo connection in 1Now stopped on ${since} because the Turo sign-in expired. ${risk}\n\nPlease open Settings in 1Now and reconnect Turo. It only takes a minute. ${after}`;
   }
 
+  // Telling the operator about one double-booking. Facts and options only:
+  // the operator decides what happens.
+  function clashMessage(op, col, now) {
+    const f = clashFacts(op, col, now);
+    const names = (cars) => cars.map((c) => c.name).join(', ');
+    const back = op.connection.reason === 'RATE_LIMITED' ? 'now that syncing is back' : "now that you've reconnected";
+    const lines = [
+      `Hi ${op.owner.first}, ${back}, we checked every booking from the gap. Your ${f.car.name} is double-booked:`,
+      '',
+      `- ${col.turo.renter} booked it on Turo: ${fmtTrip(col.turo)}`,
+      `- ${col.direct.renter} booked it on your site: ${fmtTrip(col.direct)}`,
+      '',
+    ];
+
+    if (f.turoDriving) lines.push(`${col.turo.renter} already has the car.`);
+    else if (f.siteDriving) lines.push(`${col.direct.renter} already has the car.`);
+    else lines.push(`They overlap from ${fmtWhen(col.clashStart)}, which is ${fmtUntil(col.clashStart, now)}.`);
+    lines.push('');
+
+    if (!f.freeTuro.length && !f.freeSite.length) {
+      lines.push("No other car in your fleet is free for either renter's dates.");
+    } else {
+      lines.push(`Cars free for ${firstName(col.turo.renter)}'s dates: ${f.freeTuro.length ? names(f.freeTuro) : 'none'}.`);
+      lines.push(`Cars free for ${firstName(col.direct.renter)}'s dates: ${f.freeSite.length ? names(f.freeSite) : 'none'}.`);
+      if (f.shared.length === 1) lines.push(`The ${f.shared[0].name} can only go to one of them.`);
+      if (f.shared.length > 1) lines.push('Each car that appears in both lists can only go to one of them.');
+    }
+    lines.push('', TURO_CANCEL_FACT, '');
+    lines.push("How do you want to handle it? Tell me what you decide and I'll note it on the ticket. If it helps, I can draft the message to whichever renter you move.");
+    return lines.join('\n');
+  }
+
   // The close-out summary sent to the operator.
-  // `outcomes` is one entry per double-booking: { col, keeper, kind, toCar }.
+  // `outcomes` is one entry per double-booking: { col, note }. The note is what
+  // the operator decided, in the support agent's words. It can be empty.
   function ticketSummary(op, now, reconnectedAt, outcomes, agentName) {
     const r = op.connection.reason;
     const since = op.connection.lastSync;
@@ -491,18 +414,13 @@
         ? `What it hit: Nothing. ${blind.length === 1 ? 'The booking' : `All ${blind.length} bookings`} taken while it was down checked out fine.`
         : 'What it hit: Nothing. No bookings came in on your site while it was down.');
     } else {
-      lines.push(`What it hit: ${plural(outcomes.length, 'car was', 'cars were')} double-booked.`);
+      const all = outcomes.length === 1 ? 'it' : outcomes.length === 2 ? 'both' : 'all of them';
+      lines.push(`What it hit: ${plural(outcomes.length, 'car was', 'cars were')} double-booked, and you sorted ${all}.`);
       for (const o of outcomes) {
         const car = carById(op, o.col.carId).name;
-        const moving = o.keeper.move;
-        const kept = o.keeper.keep;
-        const keptLabel = o.keeper.moveSource === 'direct' ? `${kept.renter} (Turo)` : kept.renter;
-        let what;
-        if (o.kind === 'refund') what = `${moving.renter} is refunded.`;
-        else if (o.kind === 'upgrade') what = `${moving.renter} moves to the ${o.toCar.name} at no extra cost.`;
-        else if (o.kind === 'downgrade') what = `${moving.renter} moves to the ${o.toCar.name}, with the difference refunded.`;
-        else what = `${moving.renter} moves to the ${o.toCar.name}.`;
-        lines.push(`- ${car}, ${fmtDays(moving.start, moving.end)}: ${keptLabel} keeps it. ${what}`);
+        let note = String(o.note || '').replace(/\s+/g, ' ').trim();
+        if (note && !/[.!?]$/.test(note)) note += '.';
+        lines.push(`- ${car}: ${o.col.turo.renter} (Turo) and ${o.col.direct.renter} (your site) from ${fmtWhen(o.col.clashStart)}. ${note ? `What you did: ${note}` : 'Sorted by you.'}`);
       }
       const fine = blind.length - new Set(outcomes.map((o) => o.col.direct.id)).size;
       if (fine > 0) lines.push(`The other ${plural(fine, 'booking is', 'bookings are')} fine.`);
@@ -533,13 +451,13 @@
     'The lasting fix is to warn operators before the Turo sign-in expires, which has to be built into 1Now itself.';
 
   const api = {
-    MIN, HOUR, DAY, CLASS_RANK, CLASS_LABEL, REASONS, TIERS, PATCH_NOTE,
+    MIN, HOUR, DAY, CLASS_LABEL, REASONS, TIERS, PATCH_NOTE, TURO_CANCEL_FACT,
     ms, fmtDay, fmtTime, fmtWhen, fmtTrip, fmtDays, fmtLength, fmtUntil, monthShort, dayOfMonth, isWeekend,
     ordinal, plural, firstName,
     overlaps, isDown, brokeAt, carById, bookingById, fleetSize,
     takenBlind, hiddenTuro, visibleBookings, breaksLast60, isRepeat, escalation,
-    findCollisions, checkResults, decideKeeper, replacementOptions, recommend, choiceFor,
-    renterMessage, operatorSteps, reconnectMessage, ticketSummary,
+    findCollisions, checkResults, freeCarsFor, clashFacts,
+    reconnectMessage, clashMessage, ticketSummary,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

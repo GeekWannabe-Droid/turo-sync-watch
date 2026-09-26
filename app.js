@@ -2,6 +2,11 @@
   Turo Sync Watch: the screens.
   Rules live in logic.js and sample data in data.js. This file only draws
   screens and reacts to clicks. Nothing is saved: Reset demo starts over.
+
+  Two places only:
+    1. The list of all operators.
+    2. One page per operator. It changes as the ticket moves:
+       down -> reconnected (double-bookings) -> all sorted (close the ticket).
 */
 (function () {
   'use strict';
@@ -12,16 +17,15 @@
   const app = document.getElementById('app');
 
   const fresh = () => ({
-    view: 'monitor',
+    view: 'monitor', // or 'operator'
     opId: null,
-    colId: null,
     flash: null,
     contacted: {}, // opId -> time
     reconnected: {}, // opId -> time
-    collisions: {}, // opId -> collisions found at reconnect
-    moves: {}, // collisionId -> decision { bookingId, toCarId, kind, ... }
-    picks: {}, // collisionId -> car id or 'refund'
-    drafts: {}, // collisionId -> edited message text
+    collisions: {}, // opId -> double-bookings found at reconnect
+    clash: {}, // collision id -> { status: 'told' | 'sorted', note }
+    notes: {}, // collision id -> what the operator decided, as typed so far
+    edits: {}, // textarea id -> edited text
     closed: {}, // opId -> time
   });
   let S = fresh();
@@ -37,14 +41,13 @@
   const nowMs = L.ms(NOW);
 
   const collisionsOf = (op) => S.collisions[op.id] || [];
-  const openCollisions = (op) => collisionsOf(op).filter((c) => !S.moves[c.id]);
-  const movesOf = (op) => collisionsOf(op).map((c) => S.moves[c.id]).filter(Boolean);
-  const otherMoves = (op, col) => movesOf(op).filter((m) => m.colId !== col.id);
+  const clashStatus = (c) => (S.clash[c.id] ? S.clash[c.id].status : 'open');
+  const unsorted = (op) => collisionsOf(op).filter((c) => clashStatus(c) !== 'sorted');
 
   function stateOf(op) {
     if (!L.isDown(op)) return 'healthy';
     if (S.closed[op.id]) return 'closed';
-    if (S.reconnected[op.id]) return openCollisions(op).length ? 'resolving' : 'ready';
+    if (S.reconnected[op.id]) return unsorted(op).length ? 'resolving' : 'ready';
     return 'down';
   }
 
@@ -52,16 +55,10 @@
     return source === 'turo' ? '<span class="src src-turo">Turo</span>' : '<span class="src src-site">Site</span>';
   }
 
-  function blockedText(b) {
-    if (!b) return '';
-    if (b.source === 'moved') return `Held for ${b.renter}`;
-    return b.source === 'turo' ? `Booked on Turo (${b.renter})` : `Booked on the site (${b.renter})`;
-  }
-
-  function optionsFor(op, col) {
-    const k = L.decideKeeper(col, NOW);
-    const opts = L.replacementOptions(op, col, k.move, otherMoves(op, col));
-    return { k, opts, rec: L.recommend(opts) };
+  // A textarea keeps whatever the agent typed into it, even when the page redraws.
+  function textarea(id, text, rows, extraClass) {
+    const value = typeof S.edits[id] === 'string' ? S.edits[id] : text;
+    return `<textarea id="${id}" class="message${extraClass ? ' ' + extraClass : ''}" rows="${rows}" data-edit="1">${esc(value)}</textarea>`;
   }
 
   // ---------------------------------------------------------------------------
@@ -79,31 +76,14 @@
           </div>
         </div>
         <div class="topbar-right">
-          <span class="clock" title="The demo runs on a fixed clock so it behaves the same every time.">Demo clock <b>${esc(L.fmtWhen(NOW))}</b></span>
+          <span class="clock" title="The sample bookings have fixed dates, so the tool always counts from this moment. That way it works the same on any day.">Runs as if today is <b>${esc(L.fmtWhen(NOW))}</b></span>
           <button type="button" class="btn btn-quiet btn-small" data-action="reset">Reset demo</button>
         </div>
       </header>`;
   }
 
-  const STEPS = [
-    ['monitor', 'Monitor'],
-    ['operator', 'Operator'],
-    ['check', 'Check after reconnect'],
-    ['resolve', 'Resolve'],
-    ['close', 'Close'],
-  ];
-
-  function stepsNav() {
-    const idx = STEPS.findIndex((s) => s[0] === S.view);
-    const items = STEPS.map((s, i) => {
-      const cls = i === idx ? 'is-current' : i < idx ? 'is-done' : '';
-      return `<li class="${cls}"${i === idx ? ' aria-current="step"' : ''}><span class="step-n">${i + 1}</span>${esc(s[1])}</li>`;
-    }).join('');
-    return `<nav class="steps" aria-label="Where you are in the flow"><ol>${items}</ol></nav>`;
-  }
-
   function footer() {
-    return `<footer class="footer">All operators, renters and bookings are made up. The rules are in logic.js and tested in tests/logic.test.js.</footer>`;
+    return '<footer class="footer">All operators, renters and bookings are made up. The rules are in logic.js and tested in tests/logic.test.js.</footer>';
   }
 
   function flashLine() {
@@ -115,11 +95,9 @@
     let body;
     try {
       const op = S.opId ? opById(S.opId) : null;
-      if (S.view === 'operator' && op) body = viewOperator(op);
-      else if (S.view === 'check' && op) body = viewCheck(op);
-      else if (S.view === 'resolve' && op) body = viewResolve(op, collisionsOf(op).find((c) => c.id === S.colId));
-      else if (S.view === 'close' && op) body = viewClose(op);
-      else {
+      if (S.view === 'operator' && op && stateOf(op) !== 'healthy' && stateOf(op) !== 'closed') {
+        body = viewOperator(op);
+      } else {
         S.view = 'monitor';
         body = viewMonitor();
       }
@@ -127,9 +105,10 @@
       console.error(err);
       body = `<section class="panel"><h2>This screen failed to draw</h2><p>${esc(err.message)}</p><div class="actions"><button type="button" class="btn" data-action="reset">Reset demo</button></div></section>`;
     }
-    app.innerHTML = header() + stepsNav() + `<main class="view">${flashLine()}${body}</main>` + footer();
+    app.innerHTML = header() + `<main class="view">${flashLine()}${body}</main>` + footer();
   }
 
+  // Switch page and start at the top.
   function go(view, flash) {
     S.view = view;
     S.flash = flash || null;
@@ -139,8 +118,19 @@
     if (h) h.focus({ preventScroll: true });
   }
 
+  // Redraw in place (same page), then put focus where the agent's next step is.
+  function redraw(focusId) {
+    S.flash = null;
+    render();
+    const el = focusId && document.getElementById(focusId);
+    if (el) {
+      el.focus({ preventScroll: true });
+      el.scrollIntoView({ block: 'center' });
+    }
+  }
+
   // ---------------------------------------------------------------------------
-  // 1. Monitor
+  // 1. The list of all operators
   // ---------------------------------------------------------------------------
 
   function priority(op) {
@@ -149,7 +139,7 @@
     if (st === 'healthy') return [9, 0];
     if (st === 'closed') return [8, 0];
     if (st === 'ready') return [5, 0];
-    if (st === 'resolving') return [1, openCollisions(op)[0].clashStart];
+    if (st === 'resolving') return [1, unsorted(op)[0].clashStart];
     const e = L.escalation(op, NOW);
     const rank = { 1: 0, 2: 2, 3: 3, internal: 4 }[e.tier];
     return [rank, e.first == null ? far : e.first];
@@ -170,7 +160,7 @@
     const downOps = ops.filter((o) => stateOf(o) === 'down');
     const callNow = downOps.filter((o) => L.escalation(o, NOW).tier === 1).length;
     const blind = downOps.reduce((n, o) => n + L.takenBlind(o, NOW).length, 0);
-    const open = ops.reduce((n, o) => n + (S.reconnected[o.id] ? openCollisions(o).length : 0), 0);
+    const open = ops.reduce((n, o) => n + (S.reconnected[o.id] && !S.closed[o.id] ? unsorted(o).length : 0), 0);
     const rows = ops.slice().sort(byPriority).map(monitorRow).join('');
 
     return `
@@ -182,7 +172,7 @@
         ${stat(downOps.length, downOps.length === 1 ? 'connection down' : 'connections down', downOps.length ? 'crit' : 'ok')}
         ${stat(callNow, 'to call now', callNow ? 'crit' : 'muted')}
         ${stat(blind, 'site bookings taken with no Turo check', blind ? 'warn' : 'muted')}
-        ${stat(open, 'double-bookings to resolve', open ? 'crit' : 'muted')}
+        ${stat(open, 'double-bookings not sorted yet', open ? 'crit' : 'muted')}
       </section>
       <div class="table-wrap">
         <table class="grid monitor">
@@ -229,13 +219,14 @@
     }
 
     if (st === 'resolving' || st === 'ready') {
-      const n = openCollisions(op).length;
+      const left = unsorted(op);
+      const notTold = left.filter((c) => clashStatus(c) === 'open').length;
       const status = st === 'resolving'
-        ? `<span class="pill pill-warn">Reconnected</span><div class="sub">${L.plural(n, 'double-booking')} open</div>`
-        : '<span class="pill pill-info">Reconnected</span><div class="sub">All clear</div>';
-      const next = st === 'resolving'
-        ? '<span class="pill pill-crit">Resolve double-bookings</span>'
-        : '<span class="pill pill-info">Send summary and close</span>';
+        ? `<span class="pill pill-warn">Reconnected</span><div class="sub">${L.plural(left.length, 'double-booking')} not sorted</div>`
+        : `<span class="pill pill-info">Reconnected</span><div class="sub">${collisionsOf(op).length ? 'All sorted' : 'All clear'}</div>`;
+      let next = '<span class="pill pill-info">Send summary and close</span>';
+      if (notTold) next = '<span class="pill pill-crit">Tell the operator</span>';
+      else if (left.length) next = '<span class="pill pill-warn">Waiting on the operator</span>';
       return `<tr>
         <td>${opCell}</td><td>${status}</td><td>${esc(reason.label)}</td>
         <td class="num">${L.takenBlind(op, NOW).length}</td><td class="dim">Checked</td>
@@ -269,10 +260,22 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 2. Operator (still disconnected)
+  // 2. One operator's page
   // ---------------------------------------------------------------------------
 
   function viewOperator(op) {
+    const head = `
+      <a href="#" class="back" data-action="go-monitor">← All operators</a>
+      <section class="page-head">
+        <h1 tabindex="-1">${esc(op.name)}</h1>
+        <p class="lede">${esc(op.city)} · ${L.fleetSize(op)} cars · owner ${esc(op.owner.name)}, <span class="mono select">${esc(op.owner.phone)}</span></p>
+      </section>`;
+    return head + (S.reconnected[op.id] ? afterReconnect(op) : whileDown(op));
+  }
+
+  // --- While the connection is down ---------------------------------------
+
+  function whileDown(op) {
     const e = L.escalation(op, NOW);
     const reason = L.REASONS[op.connection.reason];
     const blind = L.takenBlind(op, NOW);
@@ -286,12 +289,6 @@
     }).join('');
 
     return `
-      <a href="#" class="back" data-action="go" data-view="monitor">← All operators</a>
-      <section class="page-head">
-        <h1 tabindex="-1">${esc(op.name)}</h1>
-        <p class="lede">${esc(op.city)} · ${L.fleetSize(op)} cars · owner ${esc(op.owner.name)}, <span class="mono select">${esc(op.owner.phone)}</span></p>
-      </section>
-
       <section class="split">
         <div class="panel">
           <div class="panel-head"><h2>Turo connection down for ${esc(down)}</h2><span class="pill pill-crit">Down</span></div>
@@ -357,7 +354,6 @@
 
   function contactPanel(op, e) {
     const id = `contact-${safeId(op.id)}`;
-    const msg = L.reconnectMessage(op, NOW);
     const done = S.contacted[op.id];
     const phone = `<span class="mono select">${esc(op.owner.phone)}</span>`;
     let lead;
@@ -369,7 +365,7 @@
         <h2>Contact ${esc(op.owner.name)}</h2>
         <p>${lead}</p>
         <label class="field-label" for="${id}">Message to ${esc(op.owner.first)}</label>
-        <textarea id="${id}" class="message" rows="8">${esc(msg)}</textarea>
+        ${textarea(id, L.reconnectMessage(op, NOW), 8)}
         <div class="actions">
           <button type="button" class="btn" data-action="copy" data-target="${id}">Copy message</button>
           <button type="button" class="btn" data-action="contacted"${done ? ' disabled' : ''}>${done ? `Contacted at ${esc(L.fmtTime(done))}` : 'Mark as contacted'}</button>
@@ -386,14 +382,12 @@
       </section>`;
   }
 
-  // ---------------------------------------------------------------------------
-  // 3. Check after reconnect
-  // ---------------------------------------------------------------------------
+  // --- After reconnect ----------------------------------------------------
 
-  function viewCheck(op) {
+  function afterReconnect(op) {
     const res = L.checkResults(op, NOW);
     const cols = collisionsOf(op);
-    const open = openCollisions(op);
+    const left = unsorted(op);
     const at = S.reconnected[op.id];
     const internal = op.connection.reason === 'RATE_LIMITED';
     const n = res.checked.length;
@@ -404,8 +398,8 @@
     if (n === 0) summary = 'No bookings were taken on the site while the connection was down, so there is nothing to check.';
     else if (!bad) summary = n === 1 ? '1 booking checked. It is fine.' : `${n} bookings checked. All of them are fine.`;
     else {
-      sev = open.length ? 'crit' : 'ok';
-      summary = `${n} bookings checked. ${n - bad} ${n - bad === 1 ? 'is' : 'are'} fine. ${bad} ${bad === 1 ? 'is' : 'are'} double-booked${open.length ? '' : ', and all are resolved'}.`;
+      sev = left.length ? 'crit' : 'ok';
+      summary = `${n} bookings checked. ${n - bad} ${n - bad === 1 ? 'is' : 'are'} fine. ${bad} ${bad === 1 ? 'is' : 'are'} double-booked${left.length ? '' : ', and the operator has sorted them'}.`;
     }
 
     const pulled = res.pulled.length;
@@ -415,29 +409,28 @@
       `${L.plural(clearN, 'site booking')} taken while disconnected ${clearN === 1 ? 'now blocks its dates' : 'now block their dates'} on Turo.`,
     ];
     if (cols.length) {
-      syncLines.push(open.length
-        ? `${L.plural(open.length, 'double-booking')} ${open.length === 1 ? 'waits' : 'wait'} for a decision below.`
-        : 'Every double-booking has a decision.');
+      syncLines.push(left.length
+        ? `${L.plural(left.length, 'double-booking')} ${left.length === 1 ? 'is' : 'are'} waiting on the operator.`
+        : 'The operator has sorted every double-booking.');
     }
 
     const checkedRows = res.checked.map((b) => {
       const clash = cols.find((c) => c.direct.id === b.id);
-      const verdict = clash
-        ? (S.moves[clash.id] ? '<span class="chip chip-ok">Double-booked, resolved</span>' : '<span class="chip chip-crit">Double-booked</span>')
-        : '<span class="chip">Fine</span>';
+      let verdict = '<span class="chip">Fine</span>';
+      if (clash) verdict = clashStatus(clash) === 'sorted' ? '<span class="chip chip-ok">Double-booked, sorted</span>' : '<span class="chip chip-crit">Double-booked</span>';
       return `<tr><td>${verdict}</td><td>${esc(L.carById(op, b.carId).name)}</td><td>${esc(b.renter)}</td><td class="mono">${esc(L.fmtTrip(b))}</td></tr>`;
     }).join('');
 
     return `
-      <a href="#" class="back" data-action="go" data-view="monitor">← All operators</a>
-      <section class="page-head">
-        <h1 tabindex="-1">Check after reconnect</h1>
-        <p class="lede">${esc(op.name)}. ${internal ? 'Syncing recovered' : 'The operator reconnected'} at <span class="mono">${esc(L.fmtWhen(at))}</span>. 1Now pulled ${L.plural(pulled, 'Turo booking')} it had missed and compared both calendars for all ${L.fleetSize(op)} cars.</p>
-      </section>
+      <p class="status-line"><span class="pill pill-info">${internal ? 'Syncing recovered' : 'Reconnected'}</span> <span class="muted">${esc(L.fmtWhen(at))}. 1Now pulled ${L.plural(pulled, 'Turo booking')} it had missed and compared both calendars for all ${L.fleetSize(op)} cars.</span></p>
 
       <p class="result sev-${sev}">${esc(summary)}</p>
 
-      ${cols.length ? `<section class="page-head"><h2>Double-bookings, soonest first</h2></section>
+      ${cols.length ? `
+      <section class="page-head">
+        <h2>Double-bookings, soonest first</h2>
+        <p class="muted">Who keeps the car is ${esc(op.owner.first)}'s decision. Give him the facts, then note what he decided.</p>
+      </section>
       <div class="clashes">${cols.map((c) => clashCard(op, c)).join('')}</div>` : ''}
 
       <section class="panel">
@@ -447,8 +440,7 @@
           <span><i class="sw sw-site"></i>Operator's site</span>
           <span><i class="sw sw-blind"></i>Booked while disconnected</span>
           <span><i class="sw sw-clash"></i>Double-booked</span>
-          ${movesOf(op).some((m) => m.toCarId) ? '<span><i class="sw sw-moved"></i>Moved here</span>' : ''}
-          <span><i class="sw-now"></i>Now (demo clock)</span>
+          <span><i class="sw-now"></i>Now</span>
         </div>
         <div class="tl-scroll">${timeline(op)}</div>
       </section>
@@ -462,39 +454,109 @@
         <div class="table-wrap"><table class="grid bookings"><thead><tr><th scope="col">Result</th><th scope="col">Car</th><th scope="col">Renter</th><th scope="col">Trip</th></tr></thead><tbody>${checkedRows}</tbody></table></div>
       </details></section>` : ''}
 
-      <div class="actions end">
-        ${open.length ? `<span class="demo-note">Resolve ${open.length === 1 ? 'the double-booking' : open.length === 2 ? 'both double-bookings' : `all ${open.length} double-bookings`} first.</span>` : ''}
-        <button type="button" class="btn btn-primary" data-action="go" data-view="close"${open.length ? ' disabled' : ''}>Write the summary and close</button>
-      </div>`;
+      ${closePanel(op)}`;
+  }
+
+  function freeList(cars) {
+    if (!cars.length) return '<span class="dim">None</span>';
+    return cars.map((c) => `<span class="car-chip">${esc(c.name)} <span class="dim">${esc(L.CLASS_LABEL[c.cls])}</span></span>`).join('');
   }
 
   function clashCard(op, c) {
-    const car = L.carById(op, c.carId);
-    const mv = S.moves[c.id];
-    let done = '';
-    if (mv) {
-      done = mv.toCarId
-        ? `${mv.renter} moves to the ${L.carById(op, mv.toCarId).name}.`
-        : `${mv.renter} is refunded.`;
-    }
-    return `
-      <article class="clash${mv ? '' : ' is-open'}">
-        <header><h3>${esc(car.name)}</h3><span class="pill ${mv ? 'pill-ok' : 'pill-crit'}">${mv ? 'Resolved' : 'Open'}</span></header>
-        <p>Clash starts <b>${esc(L.fmtWhen(c.clashStart))}</b> <span class="dim">(${esc(L.fmtUntil(c.clashStart, NOW))})</span></p>
-        <dl class="pair">
-          <div><dt>${srcTag('turo')}</dt><dd>${esc(c.turo.renter)}<span class="mono">${esc(L.fmtTrip(c.turo))}</span></dd></div>
-          <div><dt>${srcTag('direct')}</dt><dd>${esc(c.direct.renter)}<span class="mono">${esc(L.fmtTrip(c.direct))}</span></dd></div>
+    const f = L.clashFacts(op, c, NOW);
+    const st = clashStatus(c);
+    const key = safeId(c.id);
+    const who = op.owner.first;
+    const pill = {
+      open: '<span class="pill pill-crit">Tell the operator</span>',
+      told: '<span class="pill pill-warn">Waiting on the operator</span>',
+      sorted: '<span class="pill pill-ok">Sorted</span>',
+    }[st];
+
+    const renter = (b, driving) => `<div><dt>${srcTag(b.source)}</dt><dd>${esc(b.renter)}${driving ? ' <span class="chip chip-warn">Has the car now</span>' : ''}<span class="mono">${esc(L.fmtTrip(b))}</span></dd></div>`;
+
+    let free;
+    if (!f.freeTuro.length && !f.freeSite.length) {
+      free = '<p><b>No other car is free</b> for either renter\'s dates.</p>';
+    } else {
+      free = `<dl class="free">
+          <div><dt>Free for ${esc(L.firstName(c.turo.renter))}'s dates</dt><dd>${freeList(f.freeTuro)}</dd></div>
+          <div><dt>Free for ${esc(L.firstName(c.direct.renter))}'s dates</dt><dd>${freeList(f.freeSite)}</dd></div>
         </dl>
-        ${mv
-          ? `<p class="done-note">${esc(done)} Message sent.</p>`
-          : `<button type="button" class="btn btn-primary" data-action="resolve" data-col="${esc(c.id)}">Resolve</button>`}
+        ${f.shared.length === 1 ? `<p class="muted">The ${esc(f.shared[0].name)} can only go to one of them.</p>` : ''}
+        ${f.shared.length > 1 ? '<p class="muted">Each car in both lists can only go to one of them.</p>' : ''}`;
+    }
+
+    const msgId = `msg-${key}`;
+    const noteId = `note-${key}`;
+    let action;
+    if (st === 'open') {
+      action = `
+        <label class="field-label" for="${msgId}">Message to ${esc(who)}</label>
+        ${textarea(msgId, L.clashMessage(op, c, NOW), 15)}
+        <div class="actions">
+          <button type="button" class="btn" data-action="copy" data-target="${msgId}">Copy message</button>
+          <button type="button" class="btn btn-primary" data-action="told" data-col="${esc(c.id)}">Mark ${esc(who)} as told</button>
+        </div>`;
+    } else if (st === 'told') {
+      const typed = typeof S.notes[c.id] === 'string' ? S.notes[c.id] : '';
+      action = `
+        <details class="sent-msg"><summary>Message sent to ${esc(who)}</summary>${textarea(msgId, L.clashMessage(op, c, NOW), 15)}</details>
+        <label class="field-label" for="${noteId}">What did ${esc(who)} decide?</label>
+        <input type="text" id="${noteId}" class="note-input" data-note="${esc(c.id)}" value="${esc(typed)}" placeholder="For example: Gave Priya the Nissan Altima">
+        <div class="actions">
+          <button type="button" class="btn btn-primary" data-action="sorted" data-col="${esc(c.id)}">Mark sorted</button>
+          <span class="demo-note">Leave it blank if he didn't say.</span>
+        </div>`;
+    } else {
+      const note = S.clash[c.id].note;
+      action = `<p class="done-note">${note ? `Sorted. What ${esc(who)} did: ${esc(note)}` : 'Sorted.'}</p>`;
+    }
+
+    return `
+      <article class="clash is-${st}" id="clash-${key}">
+        <header><h3 id="clash-title-${key}" tabindex="-1">${esc(f.car.name)}</h3>${pill}</header>
+        <p>Both renters expect this car from <b>${esc(L.fmtWhen(c.clashStart))}</b> <span class="dim">(${esc(L.fmtUntil(c.clashStart, NOW))})</span></p>
+        <dl class="pair">
+          ${renter(c.turo, f.turoDriving)}
+          ${renter(c.direct, f.siteDriving)}
+        </dl>
+        ${st === 'sorted' ? '' : `${free}
+        <p class="fact">If ${esc(who)} cancels the Turo trip, Turo can charge him a fee and adds an automatic review to the car's listing saying he cancelled. <a href="https://turo.com/us/en/policies/cancellation" target="_blank" rel="noopener">Turo's policy</a></p>`}
+        ${action}
       </article>`;
+  }
+
+  function closePanel(op) {
+    const left = unsorted(op);
+    if (left.length) {
+      return `
+        <section class="panel close-panel is-waiting">
+          <h2>Close the ticket</h2>
+          <p class="muted">Sort ${left.length === 1 ? 'the double-booking' : left.length === 2 ? 'both double-bookings' : `all ${left.length} double-bookings`} first. Then the summary for ${esc(op.owner.first)} appears here.</p>
+        </section>`;
+    }
+    const outcomes = collisionsOf(op).map((c) => ({ col: c, note: S.clash[c.id].note }));
+    const id = `summary-${safeId(op.id)}`;
+    return `
+      <section class="panel close-panel" id="close-${safeId(op.id)}">
+        <h2 tabindex="-1" id="close-title-${safeId(op.id)}">Close the ticket</h2>
+        <p class="muted">Send this to ${esc(op.owner.name)} so he knows what happened, what it hit, and what's fixed.</p>
+        <label class="field-label" for="${id}">Summary for ${esc(op.owner.first)}</label>
+        ${textarea(id, L.ticketSummary(op, NOW, S.reconnected[op.id], outcomes, D.AGENT_NAME), 17, 'summary')}
+        <div class="actions"><button type="button" class="btn" data-action="copy" data-target="${id}">Copy summary</button></div>
+        <div class="internal-note">
+          <span class="eyebrow">Internal note · not sent to the operator</span>
+          <p>${esc(L.PATCH_NOTE)}</p>
+        </div>
+        <div class="actions end">
+          <button type="button" class="btn btn-primary" data-action="close-ticket">Mark summary sent and close ticket</button>
+        </div>
+      </section>`;
   }
 
   function timeline(op) {
     const cols = collisionsOf(op);
-    const moves = movesOf(op);
-    const movedIds = new Set(moves.map((m) => m.bookingId));
     const cutoff = L.brokeAt(op);
     const DAY = L.DAY;
 
@@ -513,45 +575,36 @@
       ticks += `<div class="tick${L.isWeekend(d) ? ' wkend' : ''}${month ? '' : ' no-month'}" style="left:${pct(d)}%;width:${100 / days}%">${month ? `<em>${esc(L.monthShort(d))}</em>` : ''}${L.dayOfMonth(d)}</div>`;
     }
 
-    const bar = (b, source, moved) => {
+    const bar = (b) => {
       const s = L.ms(b.start);
       const e = L.ms(b.end);
       if (e <= startDay || s >= endDay) return '';
       const left = pct(s);
       const width = Math.max(pct(e) - left, 0.8);
       const blind = L.ms(b.createdAt) > cutoff;
-      const title = `${source === 'turo' ? 'Turo' : 'Site'} · ${b.renter} · ${L.fmtTrip(b)} · booked ${L.fmtWhen(b.createdAt)}${blind ? ' (while disconnected)' : ''}${moved ? ' · moved here' : ''}`;
-      const cls = `bar bar-${source === 'turo' ? 'turo' : 'site'}${blind ? ' is-blind' : ''}${moved ? ' is-moved' : ''}`;
+      const title = `${b.source === 'turo' ? 'Turo' : 'Site'} · ${b.renter} · ${L.fmtTrip(b)} · booked ${L.fmtWhen(b.createdAt)}${blind ? ' (while disconnected)' : ''}`;
+      const cls = `bar bar-${b.source === 'turo' ? 'turo' : 'site'}${blind ? ' is-blind' : ''}`;
       return `<div class="${cls}" style="left:${left}%;width:${width}%" title="${esc(title)}">${esc(b.renter)}</div>`;
     };
 
     const nowLeft = pct(nowMs);
     const rows = op.cars.map((car) => {
-      const onCar = op.bookings.filter((b) => b.carId === car.id && !movedIds.has(b.id));
-      const movedHere = moves
-        .filter((m) => m.toCarId === car.id)
-        .map((m) => L.bookingById(op, m.bookingId))
-        .filter(Boolean);
+      const onCar = op.bookings.filter((b) => b.carId === car.id);
       const carCols = cols.filter((c) => c.carId === car.id);
-      const openCols = carCols.filter((c) => !S.moves[c.id]);
+      const openCols = carCols.filter((c) => clashStatus(c) !== 'sorted');
       const zones = openCols.map((c) => {
         const l = pct(c.clashStart);
         return `<div class="clash-zone" style="left:${l}%;width:${Math.max(pct(c.clashEnd) - l, 0.8)}%" title="Double-booked ${esc(L.fmtWhen(c.clashStart))} → ${esc(L.fmtWhen(c.clashEnd))}"></div>`;
       }).join('');
       let flag = '<span class="chip">Clear</span>';
       if (openCols.length) flag = '<span class="chip chip-crit">Double-booked</span>';
-      else if (carCols.length) flag = '<span class="chip chip-ok">Resolved</span>';
-
-      const turo = onCar.filter((b) => b.source === 'turo').map((b) => bar(b, 'turo')).join('')
-        + movedHere.filter((b) => b.source === 'turo').map((b) => bar(b, 'turo', true)).join('');
-      const site = onCar.filter((b) => b.source === 'direct').map((b) => bar(b, 'direct')).join('')
-        + movedHere.filter((b) => b.source === 'direct').map((b) => bar(b, 'direct', true)).join('');
+      else if (carCols.length) flag = '<span class="chip chip-ok">Sorted</span>';
 
       return `<div class="tl-row">
         <div class="tl-label"><b>${esc(car.name)}</b><span class="cls">${esc(L.CLASS_LABEL[car.cls])}</span>${flag}</div>
         <div class="tl-track" style="--days:${days}">
-          <div class="lane lane-turo">${turo}</div>
-          <div class="lane lane-site">${site}</div>
+          <div class="lane lane-turo">${onCar.filter((b) => b.source === 'turo').map(bar).join('')}</div>
+          <div class="lane lane-site">${onCar.filter((b) => b.source === 'direct').map(bar).join('')}</div>
           ${zones}
           <div class="now-line" style="left:${nowLeft}%"></div>
         </div>
@@ -562,138 +615,6 @@
       <div class="tl-head"><div></div><div class="tl-days">${ticks}</div></div>
       ${rows}
     </div>`;
-  }
-
-  // ---------------------------------------------------------------------------
-  // 4. Resolve one double-booking
-  // ---------------------------------------------------------------------------
-
-  function viewResolve(op, c) {
-    if (!c) return viewCheck(op);
-    const car = L.carById(op, c.carId);
-    const { k, opts, rec } = optionsFor(op, c);
-    const pick = S.picks[c.id];
-    const isKeep = (b) => b.id === k.keep.id;
-
-    const bcard = (b) => {
-      const keep = isKeep(b);
-      const where = b.source === 'turo' ? 'Booked on Turo' : 'Booked on the site';
-      return `<div class="bcard ${keep ? 'is-keep' : 'is-move'}">
-        <div class="top">${srcTag(b.source)}<span class="pill ${keep ? 'pill-ok' : 'pill-warn'}">${keep ? 'Keeps the car' : 'Needs a new car'}</span></div>
-        <div class="who">${esc(b.renter)}</div>
-        <div class="mono">${esc(L.fmtTrip(b))}</div>
-        <div class="meta">${where} ${esc(L.fmtWhen(b.createdAt))}</div>
-      </div>`;
-    };
-
-    const optRows = opts.map((o) => optionRow(c, o, rec, pick)).join('');
-    const refundId = `opt-${safeId(c.id)}-refund`;
-    const refundRow = `<label class="opt opt-refund${pick === 'refund' ? ' is-picked' : ''}" for="${refundId}">
-      <input type="radio" name="pick-${safeId(c.id)}" id="${refundId}" value="refund" data-action="pick" data-col="${esc(c.id)}"${pick === 'refund' ? ' checked' : ''}>
-      <span class="opt-main"><b>Cancel and refund</b><span class="opt-sub">${rec.kind === 'refund' ? 'No car the same size or bigger is free for these dates' : `Use this if ${esc(L.firstName(k.move.renter))} says no to a new car`}</span></span>
-      ${rec.kind === 'refund' ? '<span class="chip chip-accent">Recommended</span>' : ''}
-    </label>`;
-
-    return `
-      <a href="#" class="back" data-action="go" data-view="check">← Check results</a>
-      <section class="page-head">
-        <h1 tabindex="-1">Double-booking: ${esc(car.name)}</h1>
-        <p class="lede">Both renters expect this car from <b>${esc(L.fmtWhen(c.clashStart))}</b> (${esc(L.fmtUntil(c.clashStart, NOW))}).</p>
-      </section>
-
-      <section class="pair-cards">${bcard(c.turo)}${bcard(c.direct)}</section>
-
-      <section class="panel">
-        <h2>Who keeps the car</h2>
-        <p><b>${esc(k.keep.renter)}</b> keeps the ${esc(car.name)}. <b>${esc(k.move.renter)}</b> needs a different car.</p>
-        <ul class="reasons">${k.reasons.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>Other cars for ${esc(L.firstName(k.move.renter))}'s dates</h2><span class="mono dim">${esc(L.fmtTrip(k.move))}</span></div>
-        <p class="muted">Every other car in the fleet, checked against Turo trips, site bookings and anyone already moved. Same size first, then a bigger car at no extra cost, then a refund.</p>
-        <fieldset class="options">
-          <legend class="sr-only">Pick what to offer ${esc(k.move.renter)}</legend>
-          ${optRows}
-          ${refundRow}
-        </fieldset>
-      </section>
-
-      ${draftBlock(op, c)}`;
-  }
-
-  function optionRow(c, o, rec, pick) {
-    const id = `opt-${safeId(c.id)}-${safeId(o.car.id)}`;
-    const fit = { same: 'Same size', bigger: 'Bigger car', smaller: 'Smaller car' }[o.fit];
-    const picked = pick === o.car.id;
-    const status = o.free ? '<span class="chip chip-ok">Free</span>' : `<span class="chip">${esc(blockedText(o.blockedBy))}</span>`;
-    return `<label class="opt${o.free ? '' : ' is-blocked'}${picked ? ' is-picked' : ''}" for="${id}">
-      <input type="radio" name="pick-${safeId(c.id)}" id="${id}" value="${esc(o.car.id)}" data-action="pick" data-col="${esc(c.id)}"${o.free ? '' : ' disabled'}${picked ? ' checked' : ''}>
-      <span class="opt-main"><b>${esc(o.car.name)}</b><span class="opt-sub">${esc(L.CLASS_LABEL[o.car.cls])} · ${fit}</span></span>
-      ${status}${rec.carId === o.car.id ? '<span class="chip chip-accent">Recommended</span>' : ''}
-    </label>`;
-  }
-
-  function draftBlock(op, c) {
-    const { k, opts } = optionsFor(op, c);
-    const choice = L.choiceFor(opts, S.picks[c.id]);
-    const edited = typeof S.drafts[c.id] === 'string';
-    const msg = edited ? S.drafts[c.id] : L.renterMessage(op, c, k, choice);
-    const id = `draft-${safeId(c.id)}`;
-    const via = k.moveSource === 'turo' ? 'Send in Turo messages.' : 'Send by text or email from 1Now.';
-    const steps = L.operatorSteps(op, c, k, choice);
-    return `
-      <section class="panel" id="draft-block">
-        <h2>Message to ${esc(k.move.renter)}</h2>
-        <p class="muted">${via} ${edited ? 'You edited this draft. Picking another option replaces your edits.' : 'Picking another option above rewrites it.'}</p>
-        <label class="sr-only" for="${id}">Message to ${esc(k.move.renter)}</label>
-        <textarea id="${id}" class="message" rows="13" data-kind="draft" data-col="${esc(c.id)}">${esc(msg)}</textarea>
-        <p class="note-keep"><b>${esc(k.keep.renter)}</b> gets no message. Their trip doesn't change, so contacting them would only worry them.</p>
-        <h3>What the operator does next</h3>
-        <ol class="todo">${steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
-        <div class="actions">
-          <button type="button" class="btn" data-action="copy" data-target="${id}">Copy message</button>
-          <button type="button" class="btn btn-primary" data-action="confirm" data-col="${esc(c.id)}">Mark as sent and resolve</button>
-        </div>
-      </section>`;
-  }
-
-  // ---------------------------------------------------------------------------
-  // 5. Close
-  // ---------------------------------------------------------------------------
-
-  function viewClose(op) {
-    const open = openCollisions(op);
-    if (open.length) {
-      return `
-        <a href="#" class="back" data-action="go" data-view="check">← Check results</a>
-        <section class="page-head"><h1 tabindex="-1">Not ready to close</h1>
-        <p class="lede">${esc(op.name)} still has ${L.plural(open.length, 'open double-booking')}. Resolve ${open.length === 1 ? 'it' : 'them'} first.</p></section>`;
-    }
-    const outcomes = collisionsOf(op).map((c) => {
-      const mv = S.moves[c.id];
-      return { col: c, keeper: L.decideKeeper(c, NOW), kind: mv.kind, toCar: mv.toCarId ? L.carById(op, mv.toCarId) : null };
-    });
-    const text = L.ticketSummary(op, NOW, S.reconnected[op.id], outcomes, D.AGENT_NAME);
-    const id = `summary-${safeId(op.id)}`;
-    return `
-      <a href="#" class="back" data-action="go" data-view="check">← Check results</a>
-      <section class="page-head">
-        <h1 tabindex="-1">Close the ticket</h1>
-        <p class="lede">${esc(op.name)}. Send this to ${esc(op.owner.name)} so they know what happened, what it hit, and what's fixed.</p>
-      </section>
-      <section class="panel">
-        <label class="field-label" for="${id}">Summary for ${esc(op.owner.first)}</label>
-        <textarea id="${id}" class="message summary" rows="18">${esc(text)}</textarea>
-        <div class="actions"><button type="button" class="btn" data-action="copy" data-target="${id}">Copy summary</button></div>
-      </section>
-      <section class="panel internal-note">
-        <span class="eyebrow">Internal note · not sent to the operator</span>
-        <p>${esc(L.PATCH_NOTE)}</p>
-      </section>
-      <div class="actions end">
-        <button type="button" class="btn btn-primary" data-action="close-ticket">Mark summary sent and close ticket</button>
-      </div>`;
   }
 
   // ---------------------------------------------------------------------------
@@ -730,21 +651,18 @@
         go('monitor', { text: 'Demo reset.' });
         break;
 
-      case 'go':
-        go(el.dataset.view);
+      case 'go-monitor':
+        go('monitor');
         break;
 
-      case 'open': {
+      case 'open':
         S.opId = el.dataset.op;
-        const st = stateOf(opById(S.opId));
-        go(st === 'down' ? 'operator' : 'check');
+        go('operator');
         break;
-      }
 
       case 'contacted':
         S.contacted[op.id] = nowMs;
-        S.flash = { text: `Marked ${op.owner.name} as contacted.` };
-        render();
+        redraw();
         break;
 
       case 'reconnect': {
@@ -752,39 +670,24 @@
         S.collisions[op.id] = L.findCollisions(op, NOW);
         const n = S.collisions[op.id].length;
         const how = op.connection.reason === 'RATE_LIMITED' ? 'Syncing recovered' : 'Reconnected';
-        go('check', { text: `${how}. ${n ? `Found ${L.plural(n, 'double-booking')}.` : 'No double-bookings.'}`, error: n > 0 });
+        go('operator', { text: `${how}. ${n ? `Found ${L.plural(n, 'double-booking')}.` : 'No double-bookings.'}`, error: n > 0 });
         break;
       }
 
-      case 'resolve': {
-        const c = collisionsOf(op).find((x) => x.id === el.dataset.col);
-        if (!c) return;
-        S.colId = c.id;
-        if (S.picks[c.id] === undefined) S.picks[c.id] = optionsFor(op, c).rec.carId || 'refund';
-        go('resolve');
+      case 'told': {
+        const id = el.dataset.col;
+        S.clash[id] = { status: 'told', note: '' };
+        redraw(`note-${safeId(id)}`);
         break;
       }
 
-      case 'confirm': {
-        const c = collisionsOf(op).find((x) => x.id === el.dataset.col);
-        if (!c) return;
-        const { k, opts } = optionsFor(op, c);
-        const choice = L.choiceFor(opts, S.picks[c.id]);
-        const toCarId = choice.car ? choice.car.id : null;
-        S.moves[c.id] = {
-          colId: c.id,
-          bookingId: k.move.id,
-          toCarId,
-          kind: choice.kind,
-          start: k.move.start,
-          end: k.move.end,
-          renter: k.move.renter,
-          source: 'moved',
-        };
-        const text = toCarId
-          ? `${k.move.renter} moves to the ${choice.car.name}. Message marked as sent.`
-          : `${k.move.renter}'s booking is cancelled and refunded. Message marked as sent.`;
-        go('check', { text });
+      case 'sorted': {
+        const id = el.dataset.col;
+        const input = document.getElementById(`note-${safeId(id)}`);
+        const note = String(input ? input.value : S.notes[id] || '').replace(/\s+/g, ' ').trim();
+        S.clash[id] = { status: 'sorted', note };
+        const next = unsorted(op)[0];
+        redraw(next ? `clash-title-${safeId(next.id)}` : `close-title-${safeId(op.id)}`);
         break;
       }
 
@@ -805,35 +708,26 @@
   app.addEventListener('click', (ev) => {
     const el = ev.target.closest('[data-action]');
     if (!el || !app.contains(el)) return;
-    const action = el.dataset.action;
-    if (action === 'pick') return; // handled on change
     if (el.tagName === 'A') ev.preventDefault();
     if (el.disabled) return;
-    act(action, el);
-  });
-
-  app.addEventListener('change', (ev) => {
-    const el = ev.target;
-    if (!el.dataset || el.dataset.action !== 'pick') return;
-    const colId = el.dataset.col;
-    S.picks[colId] = el.value;
-    delete S.drafts[colId];
-    const fieldset = el.closest('fieldset');
-    if (fieldset) {
-      fieldset.querySelectorAll('.opt').forEach((label) => {
-        const input = label.querySelector('input');
-        label.classList.toggle('is-picked', !!(input && input.checked));
-      });
-    }
-    const op = opById(S.opId);
-    const c = op && collisionsOf(op).find((x) => x.id === colId);
-    const block = document.getElementById('draft-block');
-    if (c && block) block.outerHTML = draftBlock(op, c);
+    act(el.dataset.action, el);
   });
 
   app.addEventListener('input', (ev) => {
     const el = ev.target;
-    if (el.dataset && el.dataset.kind === 'draft') S.drafts[el.dataset.col] = el.value;
+    if (!el.dataset) return;
+    if (el.dataset.edit) S.edits[el.id] = el.value;
+    if (el.dataset.note) S.notes[el.dataset.note] = el.value;
+  });
+
+  // Enter in the "what did he decide" box marks it sorted.
+  app.addEventListener('keydown', (ev) => {
+    const el = ev.target;
+    if (ev.key === 'Enter' && el.dataset && el.dataset.note) {
+      ev.preventDefault();
+      const btn = app.querySelector(`[data-action="sorted"][data-col="${CSS.escape(el.dataset.note)}"]`);
+      if (btn) btn.click();
+    }
   });
 
   render();
